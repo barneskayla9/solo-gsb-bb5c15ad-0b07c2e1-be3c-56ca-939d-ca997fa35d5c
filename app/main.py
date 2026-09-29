@@ -13,6 +13,7 @@ from jsonschema.exceptions import SchemaError
 from .minimizer import Minimizer, build_validator, pointer_from_path
 from .mutator import Mutator
 from .repairer import RepairSearcher
+from .merger import check_schema_version, merge_schemas
 from .differ import (
     DiffMinimizer,
     UnusableSchemaError,
@@ -32,9 +33,11 @@ app = FastAPI(
         "也可以给定合法样例，确定性生成覆盖各类约束关键字的最小变异实例；"
         "还可以对比新旧两版 schema 对同一实例的通过/拒绝差异，并确定性缩减"
         "出更小的差异见证；面向数据导入预览，还能在有界预算内为 required"
-        "（带 default）/ enum / const / 数值与长度边界等错误搜索最小修复候选。"
+        "（带 default）/ enum / const / 数值与长度边界等错误搜索最小修复候选；"
+        "还支持基版/甲版/乙版三方 schema 的发布前规则合并：成员级递归合并、"
+        "冲突按 JSON Pointer 报告，无冲突时再校验合并结果的合法性。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -365,3 +368,91 @@ def import_preview(req: ImportPreviewRequest) -> JSONResponse:
             },
         )
     return JSONResponse(status_code=200, content=result.to_dict())
+
+
+class SchemaMergeRequest(BaseModel):
+    # JSON Schema 本身可以是 object 或 boolean（true/false schema）。
+    base_schema: Any = Field(
+        ...,
+        title="基版 JSON Schema",
+        description="甲版与乙版共同基于的那一版 JSON Schema，支持 draft 3/4/6/7/2019-09/2020-12。",
+    )
+    schema_a: Any = Field(
+        ...,
+        title="甲版 JSON Schema",
+        description="基于基版修改的第一份 JSON Schema（支持 draft 3/4/6/7/2019-09/2020-12，含布尔 schema）。",
+    )
+    schema_b: Any = Field(
+        ...,
+        title="乙版 JSON Schema",
+        description="基于基版修改的第二份 JSON Schema（同上）。",
+    )
+
+
+def _merge_invalid_schema_body(which: str, exc: SchemaError) -> dict[str, Any]:
+    return {
+        "error": "invalid_schema",
+        "which": which,
+        "message": exc.message,
+        "path": list(exc.absolute_path),
+        "pointer": pointer_from_path(tuple(exc.absolute_path)),
+    }
+
+
+@app.post("/schema-merge")
+def schema_merge(req: SchemaMergeRequest) -> JSONResponse:
+    # 1) 三版输入各自独立校验；任一不合法即返回 422，用 which 指明版本、
+    #    path/pointer 指明位置、message 指明原因（按 base -> a -> b 顺序报告）。
+    versions = (
+        ("base_schema", req.base_schema),
+        ("schema_a", req.schema_a),
+        ("schema_b", req.schema_b),
+    )
+    for which, schema in versions:
+        invalid = check_schema_version(which, schema)
+        if invalid is not None:
+            return JSONResponse(
+                status_code=422,
+                content=_merge_invalid_schema_body(which, invalid),
+            )
+
+    # 2) 按对象成员递归三路合并；有冲突时只列冲突（JSON Pointer），不出合并结果。
+    outcome = merge_schemas(req.base_schema, req.schema_a, req.schema_b)
+    if not outcome.ok:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "conflict",
+                "merged": None,
+                "conflicts": [c.to_dict() for c in outcome.conflicts],
+                "conflict_count": len(outcome.conflicts),
+            },
+        )
+
+    # 3) 无冲突：对合并结果再做一次完整合法性校验；不合法则只报位置和原因。
+    invalid = check_schema_version("merged", outcome.merged)
+    if invalid is not None:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "invalid_merged",
+                "merged": None,
+                "conflicts": [],
+                "conflict_count": 0,
+                "merged_error": {
+                    "message": invalid.message,
+                    "path": list(invalid.absolute_path),
+                    "pointer": pointer_from_path(tuple(invalid.absolute_path)),
+                },
+            },
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "merged",
+            "merged": outcome.merged,
+            "conflicts": [],
+            "conflict_count": 0,
+        },
+    )
