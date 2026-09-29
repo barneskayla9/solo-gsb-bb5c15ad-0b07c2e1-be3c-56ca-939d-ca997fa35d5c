@@ -1,6 +1,6 @@
 # JSON Schema 反例最小化 API
 
-基于 **Python + FastAPI** 的确定性反例（counterexample）工具服务，提供四个接口：
+基于 **Python + FastAPI** 的确定性反例（counterexample）工具服务，提供五个接口：
 
 - **`POST /minimize`**：给定 JSON Schema 和一个**未通过校验**的实例，做确定性
   delta debugging 最小化，锁定首个校验错误的关键字，只保留仍触发同一关键字的候选；
@@ -12,7 +12,10 @@
   缩减步骤找出更小的**差异见证**（每个候选都必须保持两版通过/拒绝组合）；
 - **`POST /import-preview`**：面向**数据导入预览**，给定 JSON Schema、待导入实例与
   **校验次数上限**，在预算内做有界修复搜索，返回修复状态、候选实例、按
-  JSON Pointer 标识的变更链与候选的剩余错误。
+  JSON Pointer 标识的变更链与候选的剩余错误；
+- **`POST /schema-merge`**：多人协作时给定**基版、甲版、乙版**三份 JSON Schema，
+  先分别校验合法性，再以基版为参照做**三方合并**：互不相交的修改自动合并，
+  冲突按 JSON Pointer 列出且不输出部分合并结果；无冲突时校验合并结果的合法性。
 
 `/minimize` 的工作流程：
 
@@ -74,6 +77,23 @@
 5. **预算耗尽或无可行改动**时，保留搜索中见到的**最佳候选**，返回
    `status: "unrepaired"` 与 `unrepaired_reason`
    （`budget_exhausted` / `no_feasible_change`），并给出候选的剩余错误。
+
+`/schema-merge` 的工作流程：
+
+1. 先分别检查基版、甲版、乙版是否为合法 schema；任一非法即返回 422，
+   并用 `which` 指出版本、用 `path` / `message` 给出位置与原因；
+2. 以基版为参照做三方合并，**按对象成员递归比较**：
+   - 仅一方修改（另一方与基版一致）：取修改方；
+   - 双方改成**相同值**（含都未改、都删除）：只保留一次；
+   - 双方改成**不同值**：三方都是对象则继续按成员递归，其余情况
+     （**数组视为整体**、标量、类型变化）整体冲突；
+   - 一方修改、另一方**删除**：修改与删除相撞，冲突；
+   - 基版没有该成员、双方各自新增：相同保留一次，都是对象可递归，否则冲突；
+3. 有冲突时只列出全部冲突的 **JSON Pointer** 位置、冲突类型与双方取值，
+   **不输出部分合并结果**（`merged_schema` 为 `null`）；
+4. 无冲突时对合并结果再做一次 schema 合法性校验（三版各自合法不代表
+   合并后合法，例如甲把 `items` 改成 draft-07 元组形式、乙删掉 `$schema`
+   声明）；不合法返回 422 与位置、原因，同样不输出合并结果。
 
 整个过程不使用任何随机源，相同输入必然得到相同结果（依赖版本已锁定）。
 
@@ -394,6 +414,70 @@ docker compose up --build -d   # 然后访问 http://localhost:9000
 
 ---
 
+### `POST /schema-merge`
+
+多人基于同一基版各自修改规则后，发布前把甲、乙两版合并：先分别校验三版
+schema 合法性，再以基版为参照做三方合并；冲突按 JSON Pointer 列出，
+无冲突时校验合并结果的合法性。
+
+请求体：
+
+| 字段          | 类型             | 必填 | 说明                                                                 |
+| ------------- | ---------------- | ---- | -------------------------------------------------------------------- |
+| `base_schema` | object / boolean | 是   | 基版 JSON Schema（支持 Draft 3/4/6/7/2019-09/2020-12，含布尔 schema）|
+| `a_schema`    | object / boolean | 是   | 甲版 JSON Schema（在基版上修改得到）                                 |
+| `b_schema`    | object / boolean | 是   | 乙版 JSON Schema（在基版上修改得到）                                 |
+
+#### 合并规则（按对象成员递归）
+
+| 情形                                                       | 结果                                   |
+| ---------------------------------------------------------- | -------------------------------------- |
+| 仅一方修改（另一方与基版一致）                             | 取修改方                               |
+| 双方改成相同值 / 都未改 / 都删除                           | 保留一次（不冲突）                     |
+| 双方改成不同值，且三方都是对象                             | 按成员递归合并                         |
+| 双方改成不同值，其余情况（数组、标量、类型变化）           | 冲突 `both_modified`（数组视为整体）   |
+| 一方修改、另一方删除                                       | 冲突 `modify_vs_delete`                |
+| 基版没有该成员，双方新增相同值 / 都是对象                  | 保留一次 / 按成员递归合并              |
+| 基版没有该成员，双方新增不同值                             | 冲突 `both_added`                      |
+
+#### 响应 `200`
+
+| 字段            | 说明                                                                 |
+| --------------- | -------------------------------------------------------------------- |
+| `merged`        | 是否合并成功（无冲突）                                               |
+| `merged_schema` | 合并后的完整 schema；**有冲突时为 `null`，不输出部分合并结果**       |
+| `conflicts[]`   | 冲突列表（无冲突时为空数组），按确定性的递归遍历顺序排列             |
+
+`conflicts[]` 条目字段：
+
+| 字段         | 说明                                                                       |
+| ------------ | -------------------------------------------------------------------------- |
+| `pointer`    | 冲突位置的 JSON Pointer（根为 `""`）；冲突子树只报告一次，不深入逐层报告   |
+| `kind`       | `both_modified`（双方改成不同值）/ `both_added`（双方新增不同值）/ `modify_vs_delete`（修改与删除相撞） |
+| `base`       | 基版在该位置的值（`both_added` 时无此字段）                                 |
+| `a` / `b`    | 甲版 / 乙版在该位置的值（`modify_vs_delete` 时无此字段）                  |
+| `deleted_by` | 仅 `modify_vs_delete`：删除方，`"a"` 或 `"b"`                               |
+| `value`      | 仅 `modify_vs_delete`：修改方保留的值                                       |
+
+#### 错误响应（均为 `422`）
+
+- 任一输入 schema 自身不合法：
+
+  ```json
+  { "error": "invalid_schema", "which": "a_schema", "message": "...", "path": ["type"] }
+  ```
+
+  `which` 取值为 `base_schema` / `a_schema` / `b_schema`，指明是哪一版有问题。
+- 三版各自合法但**合并结果不合法**（不输出合并结果）：
+
+  ```json
+  { "error": "invalid_merged_schema", "message": "...", "path": ["items"] }
+  ```
+
+- 请求体缺少必填字段等：FastAPI/Pydantic 标准 422 结构。
+
+---
+
 ## 使用示例
 
 ```bash
@@ -633,6 +717,92 @@ r = httpx.post(
 print(r.json()["status"], r.json()["changes"])  # valid []
 ```
 
+### `/schema-merge` 示例
+
+基版要求 `id` 为整数、`name` 为字符串；甲给 `id` 加了 `minimum`，乙给 `name`
+加了 `minLength`——两处修改互不相交，自动合并：
+
+```bash
+curl -s -X POST http://localhost:8000/schema-merge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base_schema": {"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"string"}}},
+    "a_schema":    {"type":"object","properties":{"id":{"type":"integer","minimum":1},"name":{"type":"string"}}},
+    "b_schema":    {"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"string","minLength":3}}}
+  }'
+```
+
+响应：
+
+```json
+{
+  "merged": true,
+  "merged_schema": {
+    "type": "object",
+    "properties": {
+      "id": {"type": "integer", "minimum": 1},
+      "name": {"type": "string", "minLength": 3}
+    }
+  },
+  "conflicts": []
+}
+```
+
+双方把同一位置改成不同值（甲把 `minimum` 改为 1、乙改为 2），且甲删除了
+乙修改过的 `name`——两处冲突按 JSON Pointer 列出，不输出部分合并结果：
+
+```bash
+curl -s -X POST http://localhost:8000/schema-merge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base_schema": {"properties":{"age":{"minimum":0},"name":{"type":"string"}}},
+    "a_schema":    {"properties":{"age":{"minimum":1}}},
+    "b_schema":    {"properties":{"age":{"minimum":2},"name":{"type":"string","maxLength":8}}}
+  }'
+```
+
+响应：
+
+```json
+{
+  "merged": false,
+  "merged_schema": null,
+  "conflicts": [
+    {"pointer": "/properties/age/minimum", "kind": "both_modified", "base": 0, "a": 1, "b": 2},
+    {"pointer": "/properties/name", "kind": "modify_vs_delete", "deleted_by": "a", "base": {"type": "string"}, "value": {"type": "string", "maxLength": 8}}
+  ]
+}
+```
+
+Python 调用：
+
+```python
+import httpx
+
+r = httpx.post(
+    "http://localhost:8000/schema-merge",
+    json={
+        "base_schema": {"required": ["id"]},
+        "a_schema": {"required": ["id", "name"]},   # 甲：required 加一个
+        "b_schema": {"required": ["id"]},           # 乙：未改
+    },
+)
+data = r.json()
+print(data["merged"], data["merged_schema"])
+# True {'required': ['id', 'name']}
+
+# 双方对同一数组作不同修改：数组视为整体，冲突
+r = httpx.post(
+    "http://localhost:8000/schema-merge",
+    json={
+        "base_schema": {"required": ["id", "name"]},
+        "a_schema": {"required": ["id", "name", "age"]},
+        "b_schema": {"required": ["id"]},
+    },
+)
+print(r.json()["conflicts"][0]["pointer"])  # /required
+```
+
 ---
 
 ## 算法说明（确定性保证）
@@ -684,11 +854,13 @@ python -m pytest -q
 │   ├── minimizer.py        # 确定性 delta debugging 最小化内核
 │   ├── differ.py           # 两版 schema 差异见证最小化（/schema-diff，复用 minimizer）
 │   ├── mutator.py          # 确定性约束变异生成器（/mutations）
+│   ├── merger.py           # 基版/甲版/乙版三方合并（/schema-merge）
 │   └── repairer.py         # 导入预览有界修复搜索（/import-preview）
 ├── tests/
 │   ├── test_api.py             # /minimize 单元与端到端测试
 │   ├── test_schema_diff.py     # /schema-diff 单元与端到端测试
 │   ├── test_mutations.py       # /mutations 单元与端到端测试
+│   ├── test_schema_merge.py    # /schema-merge 单元与端到端测试
 │   └── test_import_preview.py  # /import-preview 单元与端到端测试
 ├── Dockerfile
 ├── docker-compose.yml

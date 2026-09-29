@@ -1,4 +1,4 @@
-"""FastAPI 入口：JSON Schema 反例最小化 + 确定性变异生成 + 导入预览修复服务。"""
+"""FastAPI 入口：JSON Schema 反例最小化 + 确定性变异生成 + 导入预览修复 + 三方合并服务。"""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from .differ import (
     UnusableSchemaError,
     side_result as first_error_side,
 )
+from .merger import SchemaMerger
 
 # ---- 配置（全部可通过环境变量覆盖）----------------------------------------
 
@@ -32,9 +33,11 @@ app = FastAPI(
         "也可以给定合法样例，确定性生成覆盖各类约束关键字的最小变异实例；"
         "还可以对比新旧两版 schema 对同一实例的通过/拒绝差异，并确定性缩减"
         "出更小的差异见证；面向数据导入预览，还能在有界预算内为 required"
-        "（带 default）/ enum / const / 数值与长度边界等错误搜索最小修复候选。"
+        "（带 default）/ enum / const / 数值与长度边界等错误搜索最小修复候选；"
+        "多人协作时，可以基版为参照把甲、乙两版 schema 的修改做三方合并，"
+        "冲突按 JSON Pointer 列出且不输出部分合并结果。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -362,6 +365,63 @@ def import_preview(req: ImportPreviewRequest) -> JSONResponse:
                 "error": "invalid_schema",
                 "message": f"schema 无法用于校验: {exc}",
                 "path": [],
+            },
+        )
+    return JSONResponse(status_code=200, content=result.to_dict())
+
+
+class SchemaMergeRequest(BaseModel):
+    # JSON Schema 本身可以是 object 或 boolean（true/false schema）。
+    base_schema: Any = Field(
+        ...,
+        title="基版 JSON Schema",
+        description="甲、乙两版共同基于的 JSON Schema，支持 draft 3/4/6/7/2019-09/2020-12。",
+    )
+    a_schema: Any = Field(
+        ...,
+        title="甲版 JSON Schema",
+        description="在基版上修改得到的甲版 JSON Schema。",
+    )
+    b_schema: Any = Field(
+        ...,
+        title="乙版 JSON Schema",
+        description="在基版上修改得到的乙版 JSON Schema。",
+    )
+
+
+@app.post("/schema-merge")
+def schema_merge(req: SchemaMergeRequest) -> JSONResponse:
+    # 三个版本各自独立校验：任一不合法都返回 422，并用 which 指明版本。
+    for which, schema in (
+        ("base_schema", req.base_schema),
+        ("a_schema", req.a_schema),
+        ("b_schema", req.b_schema),
+    ):
+        try:
+            build_validator(schema)
+        except SchemaError as exc:
+            return JSONResponse(
+                status_code=422,
+                content=_invalid_schema_body(which, exc),
+            )
+
+    result = SchemaMerger(req.base_schema, req.a_schema, req.b_schema).merge()
+    if not result.merged:
+        # 有冲突：只列出冲突的 JSON Pointer 位置，不输出部分合并结果。
+        return JSONResponse(status_code=200, content=result.to_dict())
+
+    # 无冲突：合并结果必须仍是合法 schema（例如甲把 items 改成 draft-07
+    # 元组形式、乙删掉 $schema 声明，合并结果在默认 draft 下非法），
+    # 不合法时返回位置与原因，不输出合并结果。
+    try:
+        build_validator(result.merged_schema)
+    except SchemaError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "invalid_merged_schema",
+                "message": exc.message,
+                "path": list(exc.absolute_path),
             },
         )
     return JSONResponse(status_code=200, content=result.to_dict())
